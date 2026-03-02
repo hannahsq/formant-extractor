@@ -1,121 +1,395 @@
+# training.py
+"""
+K-fold trainers for the Whisper formant probe.
+
+Two concrete trainers are provided, one per model/preprocessing pipeline:
+
+  ThreeHeadTrainer    — uses ThreeHeadPooled + FormantPreprocessor(mode="sample")
+  PhysHeadTrainer     — uses TwoHeadPooledPhys + FormantPreprocessor(mode="blended")
+
+Both inherit from MultiheadKFoldTrainer which provides:
+  - fit()             : run k-fold cross-validation
+  - fit_averaged()    : run k-fold, average fold weights, fine-tune on full data
+
+Usage
+-----
+    trainer = ThreeHeadTrainer(k=5, epochs=300)
+    fold_results = trainer.fit(embeddings, labels, formants, groups)
+
+    # or, to get a production model:
+    model = trainer.fit_averaged(embeddings, labels, formants, groups)
+    torch.save(model.state_dict(), "model.pt")
+"""
+
+from __future__ import annotations
+
+import copy
 import numpy as np
 import torch
-from torch import nn
+import torch.nn as nn
 from torch.utils.data import TensorDataset, DataLoader
 from sklearn.model_selection import KFold
 from sklearn.metrics import accuracy_score, r2_score, mean_squared_error
-from utils import labels_to_ints
-from heads import ThreeHeadPooled
+
+from utils import labels_to_ints, build_concat_embeddings
+from preprocessing import FormantPreprocessor
+from heads import ThreeHeadPooled, TwoHeadPooledPhys
 
 
 # ---------------------------------------------------------------------------
-# Preprocessing
+# Dataset helpers
 # ---------------------------------------------------------------------------
 
-class FormantPreprocessor:
-    """Fits a joint whitening transform on formant data."""
-
-    def __init__(self):
-        self.mean_ = None
-        self.inv_sqrt_cov_ = None
-        self.invL_mean_ = None
-        self.invL_std_ = None
-
-    def fit(self, F: np.ndarray) -> "FormantPreprocessor":
-        F = np.asarray(F)
-        self.mean_ = F.mean(axis=0)
-        F_center = F - self.mean_
-        cov = np.cov(F_center, rowvar=False)
-        eigvals, eigvecs = np.linalg.eigh(cov)
-        self.inv_sqrt_cov_ = eigvecs @ np.diag(1.0 / np.sqrt(eigvals)) @ eigvecs.T
-
-        invL = self._vtl_inv(F)
-        self.invL_mean_ = invL.mean()
-        self.invL_std_ = invL.std()
-        return self
-
-    def transform_formants(self, F: np.ndarray) -> np.ndarray:
-        return (F - self.mean_) @ self.inv_sqrt_cov_
-
-    def inverse_transform_formants(self, F_white: np.ndarray) -> np.ndarray:
-        return F_white @ np.linalg.inv(self.inv_sqrt_cov_) + self.mean_
-
-    def transform_vtl(self, F: np.ndarray) -> np.ndarray:
-        invL = self._vtl_inv(F)
-        return (invL - self.invL_mean_) / self.invL_std_
-
-    def inverse_transform_vtl(self, invL_norm: np.ndarray) -> np.ndarray:
-        invL = invL_norm * self.invL_std_ + self.invL_mean_
-        return 1.0 / invL
-
-    @staticmethod
-    def _vtl_inv(F: np.ndarray) -> np.ndarray:
-        L_if = 350 * np.array([1, 3, 5, 7])[None, :] / (4 * F)
-        L_sample = np.median(L_if[:, :3], axis=1)
-        return 1.0 / L_sample
-
-    @staticmethod
-    def vtl_from_formants(F: np.ndarray) -> np.ndarray:
-        L_if = 350 * np.array([1, 3, 5, 7])[None, :] / (4 * F)
-        return np.median(L_if[:, :3], axis=1)
+def _to_tensor_dataset(*arrays, dtypes) -> TensorDataset:
+    tensors = [torch.tensor(a, dtype=dt) for a, dt in zip(arrays, dtypes)]
+    return TensorDataset(*tensors)
 
 
-class EmbeddingBuilder:
-    """Concatenates encoder-layer embeddings by layer index."""
+def _gaussian_nll(
+    pred: torch.Tensor,
+    target: torch.Tensor,
+    sigma: torch.Tensor,
+) -> torch.Tensor:
+    """
+    Mean Gaussian negative log-likelihood loss.
 
-    def __init__(self, layers: list[int]):
-        self.layers = layers
+        loss = mean( log(σ) + (y - μ)² / (2σ²) )
 
-    def build(self, layer_embeddings, layers:list[int]) -> np.ndarray:
-        mats = [np.stack(layer_embeddings[l], axis=0) for l in layers]
-        return np.concatenate(mats, axis=1)
+    sigma is a fixed, precomputed quantity (whitened measurement noise from
+    the dataset) — it is not learned by the model. Samples with high σ
+    contribute less to the squared-error term, reducing the penalty for
+    inherently noisy measurements.
+    """
+    return torch.mean(
+        torch.log(sigma) + (target - pred) ** 2 / (2.0 * sigma ** 2)
+    )
 
 
 # ---------------------------------------------------------------------------
-# Training loop
+# Base trainer
 # ---------------------------------------------------------------------------
 
-class FoldTrainer:
-    """Runs a single training run (one fold) with early stopping."""
+class MultiheadKFoldTrainer:
+    """
+    Abstract base class for k-fold multihead trainers.
 
-    def __init__(self, epochs: int = 200, lr: float = 1e-3,
-                 batch_size: int = 64, patience: int = 20):
+    Subclasses must implement:
+      _build_model()      : instantiate the model for one fold
+      _make_datasets()    : build train/val TensorDatasets for one fold
+      _compute_loss()     : compute scalar loss from model output and targets
+      _evaluate_fold()    : run inference and return a metrics dict
+
+    Parameters
+    ----------
+    k           : number of folds
+    epochs      : maximum epochs per fold
+    lr          : AdamW learning rate
+    batch_size  : mini-batch size
+    patience    : early-stopping patience in epochs
+    finetune_epochs : epochs for full-data fine-tuning in fit_averaged()
+    """
+
+    def __init__(
+        self,
+        k: int = 5,
+        epochs: int = 200,
+        lr: float = 1e-3,
+        batch_size: int = 64,
+        patience: int = 20,
+        finetune_epochs: int = 50,
+    ):
+        self.k = k
         self.epochs = epochs
         self.lr = lr
         self.batch_size = batch_size
         self.patience = patience
+        self.finetune_epochs = finetune_epochs
 
-    def train(self, model: nn.Module, train_ds: TensorDataset,
-              val_ds: TensorDataset) -> nn.Module:
+        # set by _prepare_data(); available to subclasses during fit
+        self._preprocessor: FormantPreprocessor | None = None
+        self._mapping: dict | None = None
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
+
+    def fit(
+        self,
+        embeddings,
+        labels: list,
+        formants: np.ndarray,
+        groups: np.ndarray,
+        formants_sigma: np.ndarray | None = None,
+    ) -> list[dict]:
+        """
+        Run k-fold cross-validation.
+
+        Parameters
+        ----------
+        formants_sigma : (N, 4) per-sample formant standard deviations in Hz.
+                         When provided, the Gaussian NLL loss is used for
+                         formant prediction so that noisy samples are
+                         penalised less. Falls back to MSE if None.
+
+        Returns
+        -------
+        list of per-fold result dicts (keys vary by subclass).
+        """
+        data = self._prepare_data(embeddings, labels, formants, groups, formants_sigma)
+        kf = KFold(n_splits=self.k, shuffle=True, random_state=42)
+        fold_results = []
+
+        for fold, (train_idx, val_idx) in enumerate(kf.split(data["X_phys"])):
+            print(f"\n=== Fold {fold + 1}/{self.k} ===")
+            model = self._train_fold(data, train_idx, val_idx)
+            metrics = self._evaluate_fold(model, data, val_idx, groups)
+            self._print_fold(fold, metrics)
+            fold_results.append(metrics)
+
+        return fold_results
+
+    def fit_best(
+        self,
+        embeddings,
+        labels: list,
+        formants: np.ndarray,
+        groups: np.ndarray,
+        formants_sigma: np.ndarray | None = None,
+    ) -> tuple[list[dict], nn.Module]:
+        """
+        Run k-fold cross-validation and return both the per-fold metrics and
+        the single best fold model evaluated against the full dataset.
+
+        "Best" is defined as the fold whose model achieves the highest vowel
+        accuracy when run on all N samples (not just the validation split).
+        This gives a fair comparison across folds since each fold's val split
+        is a different subset.
+
+        Returns
+        -------
+        fold_results : list of per-fold metric dicts (same as fit())
+        best_model   : the nn.Module from the best fold, in eval() mode
+        """
+        data = self._prepare_data(embeddings, labels, formants, groups, formants_sigma)
+        kf   = KFold(n_splits=self.k, shuffle=True, random_state=42)
+
+        fold_results = []
+        fold_models  = []
+
+        for fold, (train_idx, val_idx) in enumerate(kf.split(data["X_phys"])):
+            print(f"\n=== Fold {fold + 1}/{self.k} ===")
+            model   = self._train_fold(data, train_idx, val_idx)
+            metrics = self._evaluate_fold(model, data, val_idx, groups)
+            self._print_fold(fold, metrics)
+            fold_results.append(metrics)
+            fold_models.append(model)
+
+        # Evaluate each fold model on the full dataset to pick the best one
+        print("\nEvaluating all fold models on full dataset to select best...")
+        all_idx    = np.arange(len(data["y_vowel"]))
+        best_acc   = -1.0
+        best_model = fold_models[0]
+        for fold, model in enumerate(fold_models):
+            metrics_full = self._evaluate_fold(model, data, all_idx, groups)
+            acc = metrics_full["vowel_acc"]
+            print(f"  Fold {fold + 1}: full-set vowel acc = {acc:.4f}")
+            if acc > best_acc:
+                best_acc   = acc
+                best_model = model
+
+        print(f"\nSelected fold model with full-set vowel acc = {best_acc:.4f}")
+        best_model.eval()
+        return fold_results, best_model
+
+    def fit_averaged(
+        self,
+        embeddings,
+        labels: list,
+        formants: np.ndarray,
+        groups: np.ndarray,
+        formants_sigma: np.ndarray | None = None,
+    ) -> nn.Module:
+        """
+        Run k-fold, average the weights across all fold models, then
+        fine-tune the averaged model on the full dataset.
+
+        Parameters
+        ----------
+        formants_sigma : see fit() docstring
+
+        Returns
+        -------
+        Fine-tuned nn.Module ready for inference / saving.
+        """
+        data = self._prepare_data(embeddings, labels, formants, groups, formants_sigma)
+        kf = KFold(n_splits=self.k, shuffle=True, random_state=42)
+        fold_models = []
+
+        for fold, (train_idx, val_idx) in enumerate(kf.split(data["X_phys"])):
+            print(f"\n=== Fold {fold + 1}/{self.k} (averaging run) ===")
+            model = self._train_fold(data, train_idx, val_idx)
+            fold_models.append(model)
+
+        print("\n=== Averaging weights across folds ===")
+        avg_model = self._average_weights(fold_models)
+
+        print(f"\n=== Fine-tuning on full dataset ({self.finetune_epochs} epochs) ===")
+        full_idx = np.arange(len(data["X_phys"]))
+        full_ds = self._make_datasets(data, full_idx, full_idx)[0]  # train only
+        avg_model = self._run_training(avg_model, full_ds, val_ds=None,
+                                       epochs=self.finetune_epochs)
+        return avg_model
+
+    def fit_and_compare(
+        self,
+        embeddings,
+        labels: list,
+        formants: np.ndarray,
+        groups: np.ndarray,
+        formants_sigma: np.ndarray | None = None,
+    ) -> dict:
+        """
+        Train fold models, average their weights, fine-tune on the full
+        dataset, then evaluate both the fold models and the averaged model
+        on the exact same validation splits.
+
+        Parameters
+        ----------
+        formants_sigma : see fit() docstring
+
+        Returns
+        -------
+        dict with keys:
+          "fold_results"  : list of per-fold metrics for each fold model
+          "avg_results"   : list of per-fold metrics for the averaged model
+                            evaluated on the same val sets
+          "avg_model"     : the fine-tuned averaged nn.Module
+          "comparison"    : list of per-fold dicts summarising the delta
+                            between averaged and fold model on key metrics
+        """
+        data   = self._prepare_data(embeddings, labels, formants, groups, formants_sigma)
+        kf     = KFold(n_splits=self.k, shuffle=True, random_state=42)
+        splits = list(kf.split(data["X_phys"]))
+
+        # --- k-fold pass: train and evaluate each fold model ---
+        fold_models  = []
+        fold_results = []
+        for fold, (train_idx, val_idx) in enumerate(splits):
+            print(f"\n=== Fold {fold + 1}/{self.k} ===")
+            model   = self._train_fold(data, train_idx, val_idx)
+            metrics = self._evaluate_fold(model, data, val_idx, groups)
+            self._print_fold(fold, metrics)
+            fold_models.append(model)
+            fold_results.append(metrics)
+
+        # --- average + fine-tune ---
+        print("\n=== Averaging weights across folds ===")
+        avg_model = self._average_weights(fold_models)
+
+        print(f"\n=== Fine-tuning on full dataset ({self.finetune_epochs} epochs) ===")
+        full_idx = np.arange(len(data["X_phys"]))
+        full_ds  = self._make_datasets(data, full_idx, full_idx)[0]
+        avg_model = self._run_training(avg_model, full_ds, val_ds=None,
+                                       epochs=self.finetune_epochs)
+
+        # --- evaluate averaged model on the same val splits ---
+        print("\n=== Evaluating averaged model on fold val sets ===")
+        avg_results = []
+        for fold, (_, val_idx) in enumerate(splits):
+            metrics = self._evaluate_fold(avg_model, data, val_idx, groups)
+            print(f"\n--- Averaged model / Fold {fold + 1} val set ---")
+            self._print_fold(fold, metrics)
+            avg_results.append(metrics)
+
+        # --- comparison summary ---
+        comparison = self._compare_results(fold_results, avg_results)
+        self._print_comparison(comparison)
+
+        return {
+            "fold_results": fold_results,
+            "avg_results":  avg_results,
+            "avg_model":    avg_model,
+            "comparison":   comparison,
+        }
+
+    # ------------------------------------------------------------------
+    # Subclass interface
+    # ------------------------------------------------------------------
+
+    def _prepare_data(self, embeddings, labels, formants, groups,
+                      formants_sigma=None) -> dict:
+        """Preprocess inputs and return a data dict shared across folds."""
+        raise NotImplementedError
+
+    def _build_model(self, data: dict) -> nn.Module:
+        """Instantiate a fresh model using shapes stored in `data`."""
+        raise NotImplementedError
+
+    def _make_datasets(
+        self, data: dict, train_idx: np.ndarray, val_idx: np.ndarray
+    ) -> tuple[TensorDataset, TensorDataset]:
+        """Return (train_ds, val_ds) for this fold."""
+        raise NotImplementedError
+
+    def _compute_loss(
+        self, out: dict, batch: tuple, ce: nn.Module, mse: nn.Module
+    ) -> torch.Tensor:
+        """Compute scalar loss from model output dict and batch targets."""
+        raise NotImplementedError
+
+    def _evaluate_fold(
+        self, model: nn.Module, data: dict,
+        val_idx: np.ndarray, groups: np.ndarray,
+    ) -> dict:
+        """Run inference on val set and return a metrics dict."""
+        raise NotImplementedError
+
+    # ------------------------------------------------------------------
+    # Shared training machinery
+    # ------------------------------------------------------------------
+
+    def _train_fold(
+        self, data: dict, train_idx: np.ndarray, val_idx: np.ndarray
+    ) -> nn.Module:
+        train_ds, val_ds = self._make_datasets(data, train_idx, val_idx)
+        model = self._build_model(data)
+        return self._run_training(model, train_ds, val_ds)
+
+    def _run_training(
+        self,
+        model: nn.Module,
+        train_ds: TensorDataset,
+        val_ds: TensorDataset | None,
+        epochs: int | None = None,
+    ) -> nn.Module:
+        epochs = epochs or self.epochs
         train_dl = DataLoader(train_ds, batch_size=self.batch_size, shuffle=True)
-        val_dl = DataLoader(val_ds, batch_size=self.batch_size)
+        val_dl   = DataLoader(val_ds,   batch_size=self.batch_size) if val_ds else None
 
         opt = torch.optim.AdamW(model.parameters(), lr=self.lr)
-        ce = nn.CrossEntropyLoss()
+        ce  = nn.CrossEntropyLoss()
         mse = nn.MSELoss()
 
-        best_state = None
-        best_val = float("inf")
+        best_state    = copy.deepcopy(model.state_dict())
+        best_val_loss = float("inf")
         patience_left = self.patience
 
-        for _ in range(self.epochs):
+        for _ in range(epochs):
             model.train()
-            for xb_phys, xb_vowel, yv, yf, yL in train_dl:
+            for batch in train_dl:
                 opt.zero_grad()
-                out = model(xb_phys, xb_vowel)
-                loss = (
-                    ce(out["vowels"], yv)
-                    + mse(out["formants"], yf)
-                    + 0.5 * mse(out["vtl"], yL)
-                )
+                out  = model(batch[0], batch[1])
+                loss = self._compute_loss(out, batch, ce, mse)
                 loss.backward()
                 opt.step()
 
-            val_loss = self._validate(model, val_dl, ce, mse)
+            if val_dl is None:
+                continue
 
-            if val_loss < best_val:
-                best_val = val_loss
-                best_state = {k: v.clone() for k, v in model.state_dict().items()}
+            val_loss = self._validate(model, val_dl, ce, mse)
+            if val_loss < best_val_loss:
+                best_val_loss = val_loss
+                best_state    = copy.deepcopy(model.state_dict())
                 patience_left = self.patience
             else:
                 patience_left -= 1
@@ -125,777 +399,407 @@ class FoldTrainer:
         model.load_state_dict(best_state)
         return model
 
-    @staticmethod
-    def _validate(model: nn.Module, val_dl: DataLoader,
-                  ce: nn.Module, mse: nn.Module) -> float:
+    def _validate(
+        self, model: nn.Module, val_dl: DataLoader,
+        ce: nn.Module, mse: nn.Module,
+    ) -> float:
         model.eval()
         total = 0.0
         with torch.no_grad():
-            for xb_phys, xb_vowel, yv, yf, yL in val_dl:
-                out = model(xb_phys, xb_vowel)
-                total += (
-                    ce(out["vowels"], yv)
-                    + mse(out["formants"], yf)
-                    + 0.5 * mse(out["vtl"], yL)
-                ).item()
+            for batch in val_dl:
+                out = model(batch[0], batch[1])
+                total += self._compute_loss(out, batch, ce, mse).item()
         return total / len(val_dl)
 
-
-# ---------------------------------------------------------------------------
-# Evaluation
-# ---------------------------------------------------------------------------
-
-class FoldEvaluator:
-    """Runs inference on a fold and returns decoded metrics and group stats."""
-
-    def evaluate(self, model: nn.Module, Xp_va: np.ndarray, Xv_va: np.ndarray,
-                 yv_va: np.ndarray, formants_va: np.ndarray,
-                 preprocessor: FormantPreprocessor,
-                 groups_va: np.ndarray) -> dict:
-
-        model.eval()
-        with torch.no_grad():
-            out = model(
-                torch.tensor(Xp_va).float(),
-                torch.tensor(Xv_va).float()
-            )
-            pred_vowel = out["vowels"].argmax(dim=1).cpu().numpy()
-            pred_form_white = out["formants"].cpu().numpy()
-            invL_pred_norm = out["vtl"].squeeze(-1).cpu().numpy()
-
-        pred_form = preprocessor.inverse_transform_formants(pred_form_white)
-        true_form = preprocessor.inverse_transform_formants(
-            preprocessor.transform_formants(formants_va)
-        )
-        L_true = FormantPreprocessor.vtl_from_formants(formants_va)
-        L_pred = preprocessor.inverse_transform_vtl(invL_pred_norm)
-
-        group_stats = self._compute_group_stats(
-            groups_va, L_true, L_pred, true_form, pred_form
-        )
-
-        metrics = {
-            "vowel_acc": accuracy_score(yv_va, pred_vowel),
-            "formant_r2": [r2_score(true_form[:, i], pred_form[:, i]) for i in range(4)],
-            "vtl_r2": r2_score(L_true, L_pred),
-            "vtl_mse": mean_squared_error(L_true, L_pred),
-            "group_stats": group_stats,
-        }
-        return metrics
+    @staticmethod
+    def _average_weights(models: list[nn.Module]) -> nn.Module:
+        """
+        Return a new model whose parameters are the element-wise mean
+        of the supplied fold models.
+        """
+        avg = copy.deepcopy(models[0])
+        avg_sd = avg.state_dict()
+        for key in avg_sd:
+            avg_sd[key] = torch.stack(
+                [m.state_dict()[key].float() for m in models], dim=0
+            ).mean(dim=0)
+        avg.load_state_dict(avg_sd)
+        return avg
 
     @staticmethod
-    def _compute_group_stats(groups_va, L_true, L_pred,
-                             true_form, pred_form) -> list[dict]:
+    def _group_stats(
+        groups_va: np.ndarray,
+        y_vowel_true: np.ndarray, y_vowel_pred: np.ndarray,
+        L_true: np.ndarray, L_pred: np.ndarray,
+        F_true: np.ndarray, F_pred: np.ndarray,
+    ) -> list[dict]:
         stats = []
         for g in np.unique(groups_va):
             mask = groups_va == g
             stats.append({
-                "group": g,
-                "L_true_mean": float(L_true[mask].mean()),
-                "L_pred_mean": float(L_pred[mask].mean()),
-                "F_true_mean": true_form[mask].mean(axis=0).tolist(),
-                "F_pred_mean": pred_form[mask].mean(axis=0).tolist(),  # bug fix
-                "n": int(mask.sum()),
+                "group":        g,
+                "vowel_acc":    float(accuracy_score(y_vowel_true[mask], y_vowel_pred[mask])),
+                "L_true_mean":  float(L_true[mask].mean()),
+                "L_pred_mean":  float(L_pred[mask].mean()),
+                "F_true_mean":  F_true[mask].mean(axis=0).tolist(),
+                "F_pred_mean":  F_pred[mask].mean(axis=0).tolist(),
+                "n":            int(mask.sum()),
             })
         return stats
 
+    @staticmethod
+    def _print_fold(fold: int, metrics: dict):
+        n = fold + 1
+        print(f"\n--- Fold {n} results ---")
+        print(f"  Vowel accuracy : {metrics['vowel_acc']:.3f}")
+        print(f"  VTL  R² / MSE  : {metrics['vtl_r2']:.3f} / {metrics['vtl_mse']:.4f}")
+
+        r2s  = metrics["formant_r2"]
+        mses = metrics.get("formant_mse")
+        header = f"  {'':6}  {'R²':>7}"
+        if mses:
+            header += f"  {'MSE':>10}"
+        print(header)
+        for i, label in enumerate(["F1", "F2", "F3", "F4"]):
+            row = f"  {label:6}  {r2s[i]:7.3f}"
+            if mses:
+                row += f"  {mses[i]:10.2f}"
+            print(row)
+
+        if "group_stats" in metrics:
+            print(f"\n  {'Group':>8}  {'Acc':>6}  {'L_true':>8}  {'L_pred':>8}  {'n':>5}")
+            print(f"  {'-'*8}  {'-'*6}  {'-'*8}  {'-'*8}  {'-'*5}")
+            for s in metrics["group_stats"]:
+                print(
+                    f"  {s['group']:>8}  {s['vowel_acc']:6.3f}"
+                    f"  {s['L_true_mean']:8.4f}  {s['L_pred_mean']:8.4f}"
+                    f"  {s['n']:5d}"
+                )
+
+    @staticmethod
+    def _compare_results(
+        fold_results: list[dict], avg_results: list[dict]
+    ) -> list[dict]:
+        """
+        Compute per-fold deltas between the averaged model and the fold model.
+        Positive delta means the averaged model outperformed the fold model.
+        """
+        comparison = []
+        for fold, (fr, ar) in enumerate(zip(fold_results, avg_results)):
+            fold_f_r2 = np.mean(fr["formant_r2"])
+            avg_f_r2  = np.mean(ar["formant_r2"])
+            comparison.append({
+                "fold":               fold + 1,
+                "vowel_acc_fold":     fr["vowel_acc"],
+                "vowel_acc_avg":      ar["vowel_acc"],
+                "vowel_acc_delta":    ar["vowel_acc"] - fr["vowel_acc"],
+                "vtl_r2_fold":        fr["vtl_r2"],
+                "vtl_r2_avg":         ar["vtl_r2"],
+                "vtl_r2_delta":       ar["vtl_r2"] - fr["vtl_r2"],
+                "formant_r2_fold":    fold_f_r2,
+                "formant_r2_avg":     avg_f_r2,
+                "formant_r2_delta":   avg_f_r2 - fold_f_r2,
+            })
+        return comparison
+
+    @staticmethod
+    def _print_comparison(comparison: list[dict]):
+        print("\n=== Fold model vs. Averaged model ===")
+        print(
+            f"  {'Fold':>5}  "
+            f"{'VowAcc(f)':>10}  {'VowAcc(a)':>10}  {'Δ':>7}  "
+            f"{'VTL R²(f)':>10}  {'VTL R²(a)':>10}  {'Δ':>7}  "
+            f"{'FmtR²(f)':>9}  {'FmtR²(a)':>9}  {'Δ':>7}"
+        )
+        print(f"  {'-'*5}  " + (f"{'-'*10}  {'-'*10}  {'-'*7}  " * 3).rstrip())
+        for c in comparison:
+            print(
+                f"  {c['fold']:>5}  "
+                f"{c['vowel_acc_fold']:10.3f}  {c['vowel_acc_avg']:10.3f}  "
+                f"{c['vowel_acc_delta']:+7.3f}  "
+                f"{c['vtl_r2_fold']:10.3f}  {c['vtl_r2_avg']:10.3f}  "
+                f"{c['vtl_r2_delta']:+7.3f}  "
+                f"{c['formant_r2_fold']:9.3f}  {c['formant_r2_avg']:9.3f}  "
+                f"{c['formant_r2_delta']:+7.3f}"
+            )
+        # Summary row: mean across folds
+        print(f"  {'-'*5}  " + (f"{'-'*10}  {'-'*10}  {'-'*7}  " * 3).rstrip())
+        print(
+            f"  {'mean':>5}  "
+            f"{np.mean([c['vowel_acc_fold']  for c in comparison]):10.3f}  "
+            f"{np.mean([c['vowel_acc_avg']   for c in comparison]):10.3f}  "
+            f"{np.mean([c['vowel_acc_delta'] for c in comparison]):+7.3f}  "
+            f"{np.mean([c['vtl_r2_fold']     for c in comparison]):10.3f}  "
+            f"{np.mean([c['vtl_r2_avg']      for c in comparison]):10.3f}  "
+            f"{np.mean([c['vtl_r2_delta']    for c in comparison]):+7.3f}  "
+            f"{np.mean([c['formant_r2_fold'] for c in comparison]):9.3f}  "
+            f"{np.mean([c['formant_r2_avg']  for c in comparison]):9.3f}  "
+            f"{np.mean([c['formant_r2_delta']for c in comparison]):+7.3f}"
+        )
+
 
 # ---------------------------------------------------------------------------
-# Orchestrator
+# ThreeHeadTrainer  (sample-mode VTL, ThreeHeadPooled)
 # ---------------------------------------------------------------------------
 
-class MultiheadKFoldTrainer:
+class ThreeHeadTrainer(MultiheadKFoldTrainer):
     """
-    Orchestrates k-fold cross-validation for the three-head Whisper probe.
+    Trainer for ThreeHeadPooled using FormantPreprocessor(mode="sample").
 
-    Parameters
-    ----------
-    layers_phys  : encoder layers used for the physical (formant/VTL) heads
-    layers_vowel : encoder layers used for the vowel classification head
-    k            : number of folds
-    epochs       : maximum training epochs per fold
-    lr           : AdamW learning rate
-    batch_size   : mini-batch size
-    patience     : early-stopping patience (epochs)
+    Layer config
+    ------------
+    layers_phys  : encoder layers concatenated for the formant + VTL heads
+    layers_vowel : encoder layers concatenated for the vowel head
     """
 
-    def __init__(self, layers_phys: list[int] = None,
-                 layers_vowel: list[int] = None,
-                 k: int = 5, epochs: int = 200,
-                 lr: float = 1e-3, batch_size: int = 64,
-                 patience: int = 20):
-        self.layers_phys = layers_phys or [0, 1, 2, 3, 4]
-        self.layers_vowel = layers_vowel or [12]
-        self.k = k
-        self.epochs = epochs
-        self.lr = lr
-        self.batch_size = batch_size
-        self.patience = patience
+    def __init__(
+        self,
+        layers_phys:  list[int] = None,
+        layers_vowel: list[int] = None,
+        **kwargs,
+    ):
+        super().__init__(**kwargs)
+        self.layers_phys  = layers_phys  or [0, 1, 2, 3, 4]
+        self.layers_vowel = layers_vowel or [-1]
 
-    def fit(self, embeddings, labels, formants, groups) -> list[dict]:
-        # --- Preprocessing ---
+    def _prepare_data(self, embeddings, labels, formants, groups,
+                      formants_sigma=None) -> dict:
         y_ints, mapping = labels_to_ints(labels)
-        y_vowel = np.array(y_ints)
+        self._mapping = mapping
         formants = np.asarray(formants)
 
-        preprocessor = FormantPreprocessor().fit(formants)
-        F_white = preprocessor.transform_formants(formants)
+        preprocessor = FormantPreprocessor(mode="sample").fit(formants)
+        self._preprocessor = preprocessor
+
+        F_white   = preprocessor.transform_formants(formants)
         invL_norm = preprocessor.transform_vtl(formants)
 
-        phys_builder = EmbeddingBuilder(self.layers_phys)
-        vowel_builder = EmbeddingBuilder(self.layers_vowel)
-        X_phys = phys_builder.build(embeddings)
-        X_vowel = vowel_builder.build(embeddings)
-
-        groups = np.array(groups)
-        kf = KFold(n_splits=self.k, shuffle=True, random_state=42)
-        fold_trainer = FoldTrainer(self.epochs, self.lr, self.batch_size, self.patience)
-        evaluator = FoldEvaluator()
-        fold_results = []
-
-        for fold, (train_idx, val_idx) in enumerate(kf.split(X_phys)):
-            print(f"\n=== Fold {fold + 1}/{self.k} ===")
-
-            train_ds, val_ds = self._make_datasets(
-                X_phys, X_vowel, y_vowel, F_white, invL_norm,
-                train_idx, val_idx
+        # Whiten sigma in the same space as the targets; fall back to
+        # unit sigma (equivalent to plain MSE) when not provided.
+        if formants_sigma is not None:
+            F_sigma_white = preprocessor.transform_formant_sigma(
+                np.asarray(formants_sigma)
             )
-
-            model = ThreeHeadPooled(
-                d_phys=X_phys.shape[1],
-                d_vowel=X_vowel.shape[1],
-                num_classes=len(mapping),
-                formant_dim=formants.shape[1]
-            )
-            model = fold_trainer.train(model, train_ds, val_ds)
-
-            metrics = evaluator.evaluate(
-                model,
-                X_phys[val_idx], X_vowel[val_idx],
-                y_vowel[val_idx], formants[val_idx],
-                preprocessor, groups[val_idx]
-            )
-
-            self._print_fold_results(fold, metrics)
-            fold_results.append({
-                "vowel_acc": metrics["vowel_acc"],
-                "formant_r2": metrics["vtl_r2"],   # kept for backward compat
-                "group_stats": metrics["group_stats"],
-            })
-
-        return fold_results
-
-    # ------------------------------------------------------------------
-    # Helpers
-    # ------------------------------------------------------------------
-
-    @staticmethod
-    def _make_datasets(X_phys, X_vowel, y_vowel, F_white, invL_norm,
-                       train_idx, val_idx):
-        def to_ds(idx):
-            return TensorDataset(
-                torch.tensor(X_phys[idx]).float(),
-                torch.tensor(X_vowel[idx]).float(),
-                torch.tensor(y_vowel[idx]).long(),
-                torch.tensor(F_white[idx]).float(),
-                torch.tensor(invL_norm[idx]).float(),
-            )
-        return to_ds(train_idx), to_ds(val_idx)
-
-    @staticmethod
-    def _print_fold_results(fold: int, metrics: dict):
-        print("\nGroup-level means:")
-        for s in metrics["group_stats"]:
-            print(
-                f"  {s['group']}: "
-                f"L_true={s['L_true_mean']:.4f}, L_pred={s['L_pred_mean']:.4f}, "
-                f"F_true={np.round(s['F_true_mean'], 1)}, "
-                f"F_pred={np.round(s['F_pred_mean'], 1)}, "
-                f"n={s['n']}"
-            )
-        print(f"Fold {fold + 1} vowel accuracy:  {metrics['vowel_acc']:.3f}")
-        print(f"Fold {fold + 1} formant R²:      {metrics['formant_r2']}")
-        print(f"Fold {fold + 1} VTL R²:          {metrics['vtl_r2']:.3f}, "
-              f"MSE: {metrics['vtl_mse']:.6f}")# train_head.py
-import torch
-import numpy as np
-from torch.utils.data import TensorDataset, DataLoader
-from sklearn.model_selection import KFold
-from sklearn.metrics import r2_score, mean_squared_error, accuracy_score
-from utils import labels_to_ints, build_concat_embeddings
-from heads import WhisperTwoHead, TwoHeadPooled, TwoHeadPooledPhys, ThreeHeadPooled
-
-
-def normalise_formants(formants):
-    mean = formants.mean(axis=0)
-    std  = formants.std(axis=0)
-    return (formants - mean) / std, mean, std
-
-
-def train_one_split(model, train_dl, val_dl, epochs=200, lr=1e-3, patience=20):
-    opt = torch.optim.AdamW(model.parameters(), lr=lr)
-    ce  = torch.nn.CrossEntropyLoss()
-    mse = torch.nn.MSELoss()
-
-    best_val_loss = float("inf")
-    patience_left = patience
-    best_state = None
-
-    for epoch in range(epochs):
-        model.train()
-        for xb_phys, xb_vowel, yv, yf in train_dl:
-            opt.zero_grad()
-            out = model(xb_phys, xb_vowel)
-            loss = ce(out["vowels"], yv) + mse(out["formants"], yf)
-            loss.backward()
-            opt.step()
-
-        # Validation
-        model.eval()
-        val_loss = 0
-        with torch.no_grad():
-            for xb_phys, xb_vowel, yv, yf in val_dl:
-                out = model(xb_phys, xb_vowel)
-                loss = ce(out["vowels"], yv) + mse(out["formants"], yf)
-                val_loss += loss.item()
-
-        val_loss /= len(val_dl)
-
-        if val_loss < best_val_loss:
-            best_val_loss = val_loss
-            best_state = model.state_dict()
-            patience_left = patience
         else:
-            patience_left -= 1
-            if patience_left == 0:
-                break
+            F_sigma_white = np.ones_like(F_white)
 
-    model.load_state_dict(best_state)
-    return model, best_val_loss
+        return {
+            "X_phys":        build_concat_embeddings(embeddings, self.layers_phys),
+            "X_vowel":       build_concat_embeddings(embeddings, self.layers_vowel),
+            "y_vowel":       np.array(y_ints),
+            "F_white":       F_white,
+            "F_sigma_white": F_sigma_white,
+            "invL_norm":     invL_norm,
+            "formants":      formants,
+            "groups":        np.array(groups),
+            "num_classes":   len(mapping),
+            "formant_dim":   formants.shape[1],
+        }
 
-def train_multihead_kfold_phys(
-    embeddings,
-    labels,
-    formants,
-    groups,
-    layer_formant=4,
-    layer_vowel=12,
-    k=5,
-    epochs=200,
-    lr=1e-3,
-    batch_size=64
-):
-    # labels → ints
-    y_ints, mapping = labels_to_ints(labels)
-    y_vowel = np.array(y_ints)
-
-    # build physical targets (invL_norm + whitened F_norm)
-    y_phys, meta = build_phys_targets(formants, groups, alpha=0.4)  # (N, 5)
-
-    # Layers for physical head (VTL + normalised/whitened formants)
-    layers_phys = [0, 1, 2, 3, 4]
-
-    # Layers for vowel head (vowel identity)
-    layers_vowel = [12]
-
-    X_phys  = build_concat_embeddings(embeddings, layers_phys)
-    X_vowel = build_concat_embeddings(embeddings, layers_vowel)
-
-    kf = KFold(n_splits=k, shuffle=True, random_state=42)
-    fold_results = []
-
-    for fold, (train_idx, val_idx) in enumerate(kf.split(X_phys)):
-        print(f"\n=== Fold {fold+1}/{k} ===")
-
-        X_phys_tr, X_phys_va   = X_phys[train_idx], X_phys[val_idx]
-        X_vowel_tr, X_vowel_va = X_vowel[train_idx], X_vowel[val_idx]
-        yv_tr, yv_va   = y_vowel[train_idx], y_vowel[val_idx]
-        yp_tr, yp_va   = y_phys[train_idx], y_phys[val_idx]
-        F_va_true      = formants[val_idx]
-
-        # ground truth L* from phys targets
-        invL_true_norm = yp_va[:, 0]
-        invL_true = invL_true_norm * meta["invL_std"] + meta["invL_mean"]
-        L_true = 1.0 / invL_true
-
-        train_ds = TensorDataset(
-            torch.tensor(X_phys_tr).float(),
-            torch.tensor(X_vowel_tr).float(),
-            torch.tensor(yv_tr).long(),
-            torch.tensor(yp_tr).float()
-        )
-        val_ds = TensorDataset(
-            torch.tensor(X_phys_va).float(),
-            torch.tensor(X_vowel_va).float(),
-            torch.tensor(yv_va).long(),
-            torch.tensor(yp_va).float()
+    def _build_model(self, data: dict) -> nn.Module:
+        return ThreeHeadPooled(
+            d_phys      = data["X_phys"].shape[1],
+            d_vowel     = data["X_vowel"].shape[1],
+            num_classes = data["num_classes"],
+            formant_dim = data["formant_dim"],
         )
 
-        train_dl = DataLoader(train_ds, batch_size=batch_size, shuffle=True)
-        val_dl   = DataLoader(val_ds, batch_size=batch_size)
+    def _make_datasets(self, data, train_idx, val_idx):
+        def ds(idx):
+            return _to_tensor_dataset(
+                data["X_phys"][idx], data["X_vowel"][idx],
+                data["y_vowel"][idx], data["F_white"][idx],
+                data["F_sigma_white"][idx], data["invL_norm"][idx],
+                dtypes=[torch.float32, torch.float32, torch.long,
+                        torch.float32, torch.float32, torch.float32],
+            )
+        return ds(train_idx), ds(val_idx)
 
-        model = TwoHeadPooledPhys(
-            d_phys=X_phys.shape[1],
-            d_vowel=X_vowel.shape[1],
-            num_classes=len(mapping),
+    def _compute_loss(self, out, batch, ce, mse):
+        _, _, yv, yf, sf, yL = batch
+        return (
+            ce(out["vowels"], yv)
+            + _gaussian_nll(out["formants"], yf, sf)
+            + 0.5 * mse(out["vtl"], yL)
         )
 
-        opt = torch.optim.AdamW(model.parameters(), lr=lr)
-        ce  = torch.nn.CrossEntropyLoss()
-        mse = torch.nn.MSELoss()
+    def _evaluate_fold(self, model, data, val_idx, groups) -> dict:
+        pre = self._preprocessor
+        Xp  = torch.tensor(data["X_phys"][val_idx]).float()
+        Xv  = torch.tensor(data["X_vowel"][val_idx]).float()
 
-        best_state = None
-        best_val = float("inf")
-        patience = 20
-        patience_left = patience
-
-        for epoch in range(epochs):
-            model.train()
-            for xb_phys, xb_vowel, yv, yp in train_dl:
-                opt.zero_grad()
-                out = model(xb_phys, xb_vowel)
-
-                # phys: [invL_norm, F1_white, F2_white, F3_white, F4_white]
-                pred_invL   = out["phys"][:, 0]
-                pred_Fwhite = out["phys"][:, 1:]
-
-                true_invL   = yp[:, 0]
-                true_Fwhite = yp[:, 1:]
-
-                loss_phys = 2.0 * mse(pred_invL, true_invL) + mse(pred_Fwhite, true_Fwhite)
-                loss = ce(out["vowels"], yv) + loss_phys
-
-                loss.backward()
-                opt.step()
-
-            # val
-            model.eval()
-            val_loss = 0.0
-            with torch.no_grad():
-                for xb_phys, xb_vowel, yv, yp in val_dl:
-                    out = model(xb_phys, xb_vowel)
-
-                    pred_invL   = out["phys"][:, 0]
-                    pred_Fwhite = out["phys"][:, 1:]
-
-                    true_invL   = yp[:, 0]
-                    true_Fwhite = yp[:, 1:]
-
-                    loss_phys = 2.0 * mse(pred_invL, true_invL) + mse(pred_Fwhite, true_Fwhite)
-                    loss = ce(out["vowels"], yv) + loss_phys
-
-                    val_loss += loss.item()
-            val_loss /= len(val_dl)
-
-            if val_loss < best_val:
-                best_val = val_loss
-                best_state = model.state_dict()
-                patience_left = patience
-            else:
-                patience_left -= 1
-                if patience_left == 0:
-                    break
-
-        model.load_state_dict(best_state)
-
-        # evaluate on this fold in Hz space
         model.eval()
         with torch.no_grad():
-            out = model(
-                torch.tensor(X_phys_va).float(),
-                torch.tensor(X_vowel_va).float()
-            )
-            pred_vowel = out["vowels"].argmax(dim=1).cpu().numpy()
-            pred_phys  = out["phys"].cpu().numpy()  # (N_val, 5)
-
-        # reconstruct VTL + formants from whitened space
-        L_va_pred, F_va_pred = invert_phys_targets(pred_phys, meta)
-
-        # --- group-level diagnostics ---
-        groups_va = np.array(groups)[val_idx]
-        unique_groups = np.unique(groups_va)
-
-        group_stats = []
-        for g in unique_groups:
-            mask = (groups_va == g)
-
-            L_true_g = L_true[mask]
-            L_pred_g = L_va_pred[mask]
-
-            F_true_g = F_va_true[mask]
-            F_pred_g = F_va_pred[mask]
-
-            group_stats.append({
-                "group": g,
-                "L_true_mean": float(L_true_g.mean()),
-                "L_pred_mean": float(L_pred_g.mean()),
-                "F_true_mean": F_true_g.mean(axis=0).tolist(),
-                "F_pred_mean": F_pred_g.mean(axis=0).tolist(),
-                "n": int(mask.sum())
-            })
-
-        print("\nGroup-level means:")
-        for s in group_stats:
-            print(
-                f"  {s['group']}: "
-                f"L_true={s['L_true_mean']:.4f}, L_pred={s['L_pred_mean']:.4f}, "
-                f"F_true={np.round(s['F_true_mean'],1)}, "
-                f"F_pred={np.round(s['F_pred_mean'],1)}, "
-                f"n={s['n']}"
-            )
-
-        # metrics
-        vowel_acc = accuracy_score(yv_va, pred_vowel)
-
-        vtl_r2  = r2_score(L_true, L_va_pred)
-        vtl_mse = mean_squared_error(L_true, L_va_pred)
-
-        formant_r2 = [r2_score(F_va_true[:, i], F_va_pred[:, i]) for i in range(4)]
-        formant_mse = [mean_squared_error(F_va_true[:, i], F_va_pred[:, i]) for i in range(4)]
-
-        fold_results.append({
-            "val_loss": best_val,
-            "vowel_acc": vowel_acc,
-            "vtl_r2": vtl_r2,
-            "vtl_mse": vtl_mse,
-            "formant_r2": formant_r2,
-            "formant_mse": formant_mse,
-        })
-
-        print(f"Fold {fold+1} vowel accuracy: {vowel_acc:.3f}")
-        print(f"Fold {fold+1} VTL R²: {vtl_r2:.3f}, MSE: {vtl_mse:.3f}")
-        print(f"Fold {fold+1} formant R²: {formant_r2}")
-
-    return fold_results
-
-def train_multihead_kfold(
-    embeddings,
-    labels,
-    formants,
-    groups,
-    layers_phys=[0,1,2,3,4],
-    layers_vowel=[12],
-    k=5,
-    epochs=200,
-    lr=1e-3,
-    batch_size=64
-):
-    # labels → ints
-    y_ints, mapping = labels_to_ints(labels)
-    y_vowel = np.array(y_ints)
-
-    # --- JOINT WHITENING OF FORMANTS ---
-    F = np.asarray(formants)
-    F_mean = F.mean(axis=0)
-    F_center = F - F_mean
-    cov = np.cov(F_center, rowvar=False)
-    eigvals, eigvecs = np.linalg.eigh(cov)
-    inv_sqrt_cov = eigvecs @ np.diag(1.0 / np.sqrt(eigvals)) @ eigvecs.T
-    F_white = F_center @ inv_sqrt_cov
-
-    # --- VTL TARGET (OPTIONAL, NOT USED FOR FORMANTS) ---
-    L_if = 350 * np.array([1,3,5,7])[None,:] / (4 * F)  # per-formant VTL
-    L_sample = np.median(L_if[:, :3], axis=1)
-    invL = 1.0 / L_sample
-    invL_mean = invL.mean()
-    invL_std  = invL.std()
-    invL_norm = (invL - invL_mean) / invL_std
-
-    # --- CONCAT EMBEDDINGS ---
-    X_phys  = build_concat_embeddings(embeddings, layers_phys)
-    X_vowel = build_concat_embeddings(embeddings, layers_vowel)
-
-    kf = KFold(n_splits=k, shuffle=True, random_state=42)
-    fold_results = []
-
-    for fold, (train_idx, val_idx) in enumerate(kf.split(X_phys)):
-        print(f"\n=== Fold {fold+1}/{k} ===")
-
-        Xp_tr, Xp_va = X_phys[train_idx], X_phys[val_idx]
-        Xv_tr, Xv_va = X_vowel[train_idx], X_vowel[val_idx]
-
-        yv_tr, yv_va = y_vowel[train_idx], y_vowel[val_idx]
-        yf_tr, yf_va = F_white[train_idx], F_white[val_idx]
-        yL_tr, yL_va = invL_norm[train_idx], invL_norm[val_idx]
-
-        L_if = 350 * np.array([1,3,5,7])[None,:] / (4 * formants[val_idx])
-        L_true = np.median(L_if[:, :3], axis=1)
-
-        train_ds = TensorDataset(
-            torch.tensor(Xp_tr).float(),
-            torch.tensor(Xv_tr).float(),
-            torch.tensor(yv_tr).long(),
-            torch.tensor(yf_tr).float(),
-            torch.tensor(yL_tr).float()
-        )
-        val_ds = TensorDataset(
-            torch.tensor(Xp_va).float(),
-            torch.tensor(Xv_va).float(),
-            torch.tensor(yv_va).long(),
-            torch.tensor(yf_va).float(),
-            torch.tensor(yL_va).float()
-        )
-
-        train_dl = DataLoader(train_ds, batch_size=batch_size, shuffle=True)
-        val_dl   = DataLoader(val_ds, batch_size=batch_size)
-
-        model = ThreeHeadPooled(
-            d_phys=Xp_tr.shape[1],
-            d_vowel=Xv_tr.shape[1],
-            num_classes=len(mapping),
-            formant_dim=formants.shape[1]
-        )
-
-        opt = torch.optim.AdamW(model.parameters(), lr=lr)
-        ce  = torch.nn.CrossEntropyLoss()
-        mse = torch.nn.MSELoss()
-
-        best_state = None
-        best_val = float("inf")
-        patience = 20
-        patience_left = patience
-
-        for epoch in range(epochs):
-            model.train()
-            for xb_phys, xb_vowel, yv, yf, yL in train_dl:
-                opt.zero_grad()
-                out = model(xb_phys, xb_vowel)
-
-                loss_vowel = ce(out["vowels"], yv)
-                loss_form  = mse(out["formants"], yf)
-                loss_vtl   = mse(out["vtl"], yL)
-
-                loss = loss_vowel + loss_form + 0.5 * loss_vtl
-                loss.backward()
-                opt.step()
-
-            # validation
-            model.eval()
-            val_loss = 0.0
-            with torch.no_grad():
-                for xb_phys, xb_vowel, yv, yf, yL in val_dl:
-                    out = model(xb_phys, xb_vowel)
-                    loss = (
-                        ce(out["vowels"], yv)
-                        + mse(out["formants"], yf)
-                        + 0.5 * mse(out["vtl"], yL)
-                    )
-                    val_loss += loss.item()
-            val_loss /= len(val_dl)
-
-            if val_loss < best_val:
-                best_val = val_loss
-                best_state = model.state_dict()
-                patience_left = patience
-            else:
-                patience_left -= 1
-                if patience_left == 0:
-                    break
-
-        model.load_state_dict(best_state)
-
-        # --- Evaluate ---
-        model.eval()
-        with torch.no_grad():
-            out = model(
-                torch.tensor(Xp_va).float(),
-                torch.tensor(Xv_va).float()
-            )
-            # --- Model outputs ---
-            pred_vowel = out["vowels"].argmax(dim=1).cpu().numpy()
+            out = model(Xp, Xv)
+            pred_vowel      = out["vowels"].argmax(dim=1).cpu().numpy()
             pred_form_white = out["formants"].cpu().numpy()
-            invL_pred_norm = out["vtl"].cpu().numpy()
+            invL_pred_norm  = out["vtl"].cpu().numpy()
 
-        # --- Unwhiten predicted formants ---
-        pred_form = (pred_form_white @ np.linalg.inv(inv_sqrt_cov)) + F_mean
+        formants_va = data["formants"][val_idx]
 
-        # --- Unwhiten true formants (from validation targets) ---
-        true_form_white = yf_va
-        true_form = (true_form_white @ np.linalg.inv(inv_sqrt_cov)) + F_mean
+        # L_true: invert the stored normalised targets so it matches exactly
+        # what the model was trained to predict — the preprocessor's L_star
+        # (sample mode: median VTL over F1-F3), not a freshly computed estimate.
+        L_true = pre.inverse_transform_vtl(data["invL_norm"][val_idx])
+        L_pred = pre.inverse_transform_vtl(invL_pred_norm)
 
-        # --- Compute true VTL from raw formants ---
-        L_if = 350 * np.array([1,3,5,7])[None,:] / (4 * formants[val_idx])
-        L_true = np.median(L_if[:, :3], axis=1)
+        # In sample mode inverse_transform_formants returns Hz directly.
+        # true_form uses the raw formants (the sample-mode whitening is
+        # invertible and round-trips losslessly, so this is equivalent).
+        pred_form = pre.inverse_transform_formants(pred_form_white)
+        true_form = formants_va
 
-        # --- Compute predicted VTL ---
-        invL_pred = invL_pred_norm * invL_std + invL_mean
-        L_pred = 1.0 / invL_pred
+        groups_va  = np.array(groups)[val_idx]
+        y_vowel_va = data["y_vowel"][val_idx]
+        return {
+            "vowel_acc":   accuracy_score(y_vowel_va, pred_vowel),
+            "formant_r2":  [r2_score(true_form[:, i], pred_form[:, i]) for i in range(4)],
+            "formant_mse": [mean_squared_error(true_form[:, i], pred_form[:, i]) for i in range(4)],
+            "vtl_r2":      r2_score(L_true, L_pred),
+            "vtl_mse":     mean_squared_error(L_true, L_pred),
+            "group_stats": self._group_stats(groups_va, y_vowel_va, pred_vowel,
+                                             L_true, L_pred, true_form, pred_form),
+        }
 
-        groups_va = np.array(groups)[val_idx]
-        unique_groups = np.unique(groups_va)
-        
-        group_stats = []
-        for g in unique_groups:
-            mask = (groups_va == g)
 
-            L_true_g = L_true[mask]
-            L_pred_g = L_pred[mask]
+# ---------------------------------------------------------------------------
+# PhysHeadTrainer  (blended-mode VTL, TwoHeadPooledPhys)
+# ---------------------------------------------------------------------------
 
-            F_true_g = true_form[mask]
-            F_pred_g = true_form[mask]
+class PhysHeadTrainer(MultiheadKFoldTrainer):
+    """
+    Trainer for TwoHeadPooledPhys using FormantPreprocessor(mode="blended").
 
-            group_stats.append({
-                "group": g,
-                "L_true_mean": float(L_true_g.mean()),
-                "L_pred_mean": float(L_pred_g.mean()),
-                "F_true_mean": F_true_g.mean(axis=0).tolist(),
-                "F_pred_mean": F_pred_g.mean(axis=0).tolist(),
-                "n": int(mask.sum())
-            })
+    The physical head predicts a 5-vector [invL_norm, F1_white, …, F4_white]
+    where formants are normalised relative to the speaker-blended ideal tube.
+    The vowel head conditions on the predicted normalised formants.
 
-        print("\nGroup-level means:")
-        for s in group_stats:
-            print(
-                f"  {s['group']}: "
-                f"L_true={s['L_true_mean']:.4f}, L_pred={s['L_pred_mean']:.4f}, "
-                f"F_true={np.round(s['F_true_mean'],1)}, "
-                f"F_pred={np.round(s['F_pred_mean'],1)}, "
-                f"n={s['n']}"
+    Layer config
+    ------------
+    layers_phys  : encoder layers for the physical head (default: 0–4)
+    layers_vowel : encoder layers for the vowel head   (default: [12])
+    alpha        : sample/speaker VTL blend weight (passed to preprocessor)
+    vtl_loss_weight : weight on invL term in physical loss
+    """
+
+    def __init__(
+        self,
+        layers_phys:      list[int] = None,
+        layers_vowel:     list[int] = None,
+        alpha:            float = 0.4,
+        vtl_loss_weight:  float = 2.0,
+        **kwargs,
+    ):
+        super().__init__(**kwargs)
+        self.layers_phys     = layers_phys  or [0, 1, 2, 3, 4]
+        self.layers_vowel    = layers_vowel or [-1]
+        self.alpha           = alpha
+        self.vtl_loss_weight = vtl_loss_weight
+
+    def _prepare_data(self, embeddings, labels, formants, groups,
+                      formants_sigma=None) -> dict:
+        y_ints, mapping = labels_to_ints(labels)
+        self._mapping = mapping
+        formants = np.asarray(formants)
+        groups   = np.asarray(groups)
+
+        preprocessor = FormantPreprocessor(
+            mode="blended", alpha=self.alpha
+        ).fit(formants, groups)
+        self._preprocessor = preprocessor
+
+        F_white   = preprocessor.transform_formants(formants, groups)
+        invL_norm = preprocessor.transform_vtl(formants, groups)
+        y_phys    = np.concatenate([invL_norm[:, None], F_white], axis=1)
+
+        # Whiten sigma in the same dimensionless space as the μ targets.
+        # Prepend a unit column for the invL slot (VTL still uses MSE).
+        if formants_sigma is not None:
+            F_sigma_white = preprocessor.transform_formant_sigma(
+                np.asarray(formants_sigma), groups=groups, formants_hz=formants
             )
+        else:
+            F_sigma_white = np.ones_like(F_white)
 
-        # --- Metrics ---
-        vowel_acc = accuracy_score(yv_va, pred_vowel)
-        formant_r2 = [r2_score(true_form[:, i], pred_form[:, i]) for i in range(4)]
-        vtl_r2  = r2_score(L_true, L_pred)
-        vtl_mse = mean_squared_error(L_true, L_pred)
+        sigma_phys = np.concatenate(
+            [np.ones((len(formants), 1)), F_sigma_white], axis=1
+        )  # (N, 5) — first column is placeholder for invL (MSE, not NLL)
 
-        print(f"Fold {fold+1} vowel accuracy: {vowel_acc:.3f}")
-        print(f"Fold {fold+1} formant R²: {formant_r2}")
-        print(f"Fold {fold+1} VTL R²: {vtl_r2:.3f}, MSE: {vtl_mse:.6f}")
+        return {
+            "X_phys":      build_concat_embeddings(embeddings, self.layers_phys),
+            "X_vowel":     build_concat_embeddings(embeddings, self.layers_vowel),
+            "y_vowel":     np.array(y_ints),
+            "y_phys":      y_phys,
+            "sigma_phys":  sigma_phys,
+            "formants":    formants,
+            "groups":      groups,
+            "num_classes": len(mapping),
+        }
 
+    def _build_model(self, data: dict) -> nn.Module:
+        return TwoHeadPooledPhys(
+            d_phys      = data["X_phys"].shape[1],
+            d_vowel     = data["X_vowel"].shape[1],
+            num_classes = data["num_classes"],
+        )
 
-        fold_results.append({
-            "val_loss": best_val,
-            "vowel_acc": vowel_acc,
-            "formant_r2": vtl_r2
-        })
+    def _make_datasets(self, data, train_idx, val_idx):
+        def ds(idx):
+            return _to_tensor_dataset(
+                data["X_phys"][idx], data["X_vowel"][idx],
+                data["y_vowel"][idx], data["y_phys"][idx],
+                data["sigma_phys"][idx],
+                dtypes=[torch.float32, torch.float32,
+                        torch.long, torch.float32, torch.float32],
+            )
+        return ds(train_idx), ds(val_idx)
 
-    return fold_results
+    def _compute_loss(self, out, batch, ce, mse):
+        _, _, yv, yp, sp = batch
+        pred_invL,   true_invL   = out["phys"][:, 0], yp[:, 0]
+        pred_Fwhite, true_Fwhite = out["phys"][:, 1:], yp[:, 1:]
+        sigma_F = sp[:, 1:]   # formant σ only; invL still uses weighted MSE
+        loss_phys = (
+            self.vtl_loss_weight * mse(pred_invL, true_invL)
+            + _gaussian_nll(pred_Fwhite, true_Fwhite, sigma_F)
+        )
+        return ce(out["vowels"], yv) + loss_phys
 
+    def _evaluate_fold(self, model, data, val_idx, groups) -> dict:
+        pre         = self._preprocessor
+        formants_va = data["formants"][val_idx]
+        groups_va   = np.asarray(groups)[val_idx]
+        y_phys_va   = data["y_phys"][val_idx]
 
-def train_multihead(
-    embeddings,
-    labels,
-    formants,
-    layer_formant=4,
-    layer_vowel=12,
-    epochs=20,
-    lr=1e-3,
-    batch_size=64
-):
-    # Extract pooled embeddings for each head
-    X_phys  = torch.tensor(np.stack(embeddings[layer_formant])).float()
-    X_vowel = torch.tensor(np.stack(embeddings[layer_vowel])).float()
+        Xp = torch.tensor(data["X_phys"][val_idx]).float()
+        Xv = torch.tensor(data["X_vowel"][val_idx]).float()
 
-    y_ints, mapping = labels_to_ints(labels)
-    y_vowel = torch.tensor(y_ints).long()
-    y_form  = torch.tensor(formants).float()
+        model.eval()
+        with torch.no_grad():
+            out        = model(Xp, Xv)
+            pred_vowel = out["vowels"].argmax(dim=1).cpu().numpy()
+            pred_phys  = out["phys"].cpu().numpy()
 
-    ds = TensorDataset(X_phys, X_vowel, y_vowel, y_form)
-    dl = DataLoader(ds, batch_size=batch_size, shuffle=True)
+        # Recover predicted VTL and formants in Hz
+        invL_norm_pred = pred_phys[:, 0]
+        L_pred  = pre.inverse_transform_vtl(invL_norm_pred)
+        F_pred  = pre.recover_formants_hz(pred_phys[:, 1:], L_pred)
 
-    model = TwoHeadPooled(
-        d_model=X_phys.shape[1],
-        num_classes=len(set(labels)),
-        formant_dim=formants.shape[1]
-    )
+        # L_true: invert the stored normalised targets to get the blended
+        # L_star the model was trained against — consistent with L_pred.
+        L_true  = pre.inverse_transform_vtl(y_phys_va[:, 0])
 
-    opt = torch.optim.AdamW(model.parameters(), lr=lr)
-    ce  = torch.nn.CrossEntropyLoss()
-    mse = torch.nn.MSELoss()
+        # F_true: recover Hz using the true L_star (same inversion path as pred)
+        F_true  = pre.recover_formants_hz(y_phys_va[:, 1:], L_true)
 
-    model.train()
-    for epoch in range(epochs):
-        total_loss = 0
-        for xb_phys, xb_vowel, yv, yf in dl:
-            opt.zero_grad()
-            out = model(xb_phys, xb_vowel)
-
-            loss = ce(out["vowels"], yv) + mse(out["formants"], yf)
-            loss.backward()
-            opt.step()
-
-            total_loss += loss.item() * xb_phys.size(0)
-
-        print(f"Epoch {epoch+1}: loss={total_loss/len(ds):.4f}")
-
-    return model
-
-
-
-def train_whisper_multihead(embeddings, labels, num_classes, epochs=20, lr=1e-3, batch_size=64):
-    X = torch.from_numpy(embeddings).float()      # (N, D)
-    y = torch.from_numpy(labels).long()           # (N,)
-
-    ds = TensorDataset(X, y)
-    dl = DataLoader(ds, batch_size=batch_size, shuffle=True)
-
-    model = WhisperTwoHead(in_dim=X.shape[1], num_classes=num_classes)
-    opt = torch.optim.AdamW(model.parameters(), lr=lr)
-    loss_fn = torch.nn.CrossEntropyLoss()
-
-    model.train()
-    for epoch in range(epochs):
-        total_loss = 0.0
-        for xb, yb in dl:
-            opt.zero_grad()
-            logits = model(xb)
-            loss = loss_fn(logits, yb)
-            loss.backward()
-            opt.step()
-            total_loss += loss.item() * xb.size(0)
-        print(f"Epoch {epoch+1}: loss={total_loss/len(ds):.4f}")
-
-    return model
-
-
-def evaluate_multihead(
-    model,
-    embeddings,
-    labels,
-    formants,
-    layer_formant=4,
-    layer_vowel=12
-):
-    """
-    Evaluate the trained multi-head model on pooled embeddings.
-    Returns a dict with:
-        - vowel_accuracy
-        - formant_mse (per formant)
-        - formant_r2 (per formant)
-    """
-
-    # Convert labels → ints
-    y_ints, mapping = labels_to_ints(labels)
-    y_vowel = np.array(y_ints)
-    y_form  = np.array(formants)
-
-    # Extract pooled embeddings
-    X_phys  = np.stack(embeddings[layer_formant])
-    X_vowel = np.stack(embeddings[layer_vowel])
-
-    X_phys_t  = torch.tensor(X_phys).float()
-    X_vowel_t = torch.tensor(X_vowel).float()
-
-    model.eval()
-    with torch.no_grad():
-        out = model(X_phys_t, X_vowel_t)
-        pred_vowel = out["vowels"].argmax(dim=1).cpu().numpy()
-        pred_form  = out["formants"].cpu().numpy()
-
-    # Compute metrics
-    vowel_acc = accuracy_score(y_vowel, pred_vowel)
-
-    mse_per_formant = []
-    r2_per_formant  = []
-
-    for i in range(y_form.shape[1]):
-        mse_per_formant.append(mean_squared_error(y_form[:, i], pred_form[:, i]))
-        r2_per_formant.append(r2_score(y_form[:, i], pred_form[:, i]))
-
-    return {
-        "vowel_accuracy": vowel_acc,
-        "formant_mse": mse_per_formant,
-        "formant_r2": r2_per_formant,
-        "mapping": mapping
-    }
+        y_vowel_va = data["y_vowel"][val_idx]
+        return {
+            "vowel_acc":   accuracy_score(y_vowel_va, pred_vowel),
+            "formant_r2":  [r2_score(F_true[:, i], F_pred[:, i]) for i in range(4)],
+            "formant_mse": [mean_squared_error(F_true[:, i], F_pred[:, i])
+                            for i in range(4)],
+            "vtl_r2":      r2_score(L_true, L_pred),
+            "vtl_mse":     mean_squared_error(L_true, L_pred),
+            "group_stats": self._group_stats(groups_va, y_vowel_va, pred_vowel,
+                                             L_true, L_pred, F_true, F_pred),
+        }
