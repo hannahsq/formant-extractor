@@ -1,295 +1,388 @@
 # runner.py
-import torch
-import numpy as np
-from probing import probe_all_layers, run_formant_probe, run_formant_regression_per_formant
-from viz import plot_layerwise_accuracy, plot_pca_embeddings, plot_umap_embeddings, plot_formant_r2, plot_formant_r2_per_formant, print_eval_report
-from utils import labels_to_ints
-from train_head import train_multihead, evaluate_multihead, train_multihead_kfold, train_multihead_kfold_phys
-from cache_embeddings import get_or_compute_embeddings
+"""
+High-level entry points for the Whisper formant probe experiments.
 
-def _run_probes(all_layers_embeddings, labels, pooling):
+Typical usage
+-------------
+    from datasets_hf import load_hillenbrand
+    from runner import run_probe, run_vowel_probe, run_formant_probe
+    from runner import run_kfold, run_kfold_phys, run_averaged_model
+
+    dataset = load_hillenbrand()
+
+    # Both probes in one call
+    run_probe("openai/whisper-small", dataset)
+
+    # Or independently
+    run_formant_probe("openai/whisper-small", dataset)
+    run_vowel_probe("openai/whisper-small", dataset)
+
+    # k-fold cross-validation (ThreeHead / sample-VTL pipeline)
+    results = run_kfold("openai/whisper-small", dataset)
+
+    # k-fold cross-validation (PhysHead / blended-VTL pipeline)
+    results = run_kfold_phys("openai/whisper-small", dataset)
+
+    # Train, weight-average, fine-tune, and save a production model
+    model = run_averaged_model("openai/whisper-small", dataset, save_path="model.pt")
+"""
+
+from __future__ import annotations
+
+import numpy as np
+import torch
+
+from embeddings import get_or_compute_embeddings, pool, pool_layer_embeddings
+from probing import probe_all_layers
+from training import ThreeHeadTrainer, PhysHeadTrainer
+from utils import labels_to_ints
+from viz import (
+    plot_layerwise_accuracy,
+    plot_pca_embeddings,
+    plot_umap_embeddings,
+    plot_formant_r2,
+    plot_formant_r2_per_formant,
+)
+
+
+# ---------------------------------------------------------------------------
+# Shared embedding config (passed through to every runner)
+# ---------------------------------------------------------------------------
+
+def _get_embeddings(model_name, hf_dataset, sr, pooling,
+                    cache_root, use_cache, subset, nucleus_ms):
     """
-    Shared helper to run probes + visualisations.
+    Return pooled (D,) embeddings as a materialised list for the multihead trainers.
+
+    Tries to derive pooled embeddings from the sequence cache (store_sequences=True)
+    to avoid re-running the encoder. Falls back to a dedicated pooled cache only
+    if no sequence cache exists.
     """
-    y_ints, mapping = labels_to_ints(labels)
-    results = probe_all_layers(all_layers_embeddings, y_ints, pooling=pooling)
+    ds = hf_dataset[:subset] if subset else hf_dataset
+
+    # Try sequence cache first — pool on the fly, much cheaper than re-extracting
+    seq_iter, labels, formants = get_or_compute_embeddings(
+        model_name, ds,
+        sr=sr, cache_root=cache_root, use_cache=use_cache,
+        subset=None, nucleus_ms=nucleus_ms,
+        store_sequences=True,
+    )
+    embeddings = [
+        [pool(s, pooling) for s in samples]
+        for _, samples in seq_iter
+    ]
+    return embeddings, labels, formants
+
+
+def _get_sequence_embeddings(model_name, hf_dataset, sr,
+                              cache_root, use_cache, subset, nucleus_ms):
+    """Return a lazy layer iterator over (T, D) sequences."""
+    return get_or_compute_embeddings(
+        model_name, hf_dataset,
+        sr=sr,
+        cache_root=cache_root, use_cache=use_cache,
+        subset=subset, nucleus_ms=nucleus_ms,
+        store_sequences=True,
+    )
+
+
+def _groups_from(hf_dataset) -> list:
+    return [item["group"] for item in hf_dataset]
+
+
+# ---------------------------------------------------------------------------
+# Linear probe sweep
+# ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# Probe entry points
+# ---------------------------------------------------------------------------
+
+def _probe_formant_common(ds, layer_iter, labels, formants):
+    """
+    Shared internals for run_formant_probe: stream one layer at a time,
+    train the MLP probe, collect results, then plot.
+    """
+    from preprocessing import FormantPreprocessor
+    from probing import train_formant_mlp, _pool_if_needed
+
+    formants_arr = np.asarray(formants)
+    pre          = FormantPreprocessor(mode="sample").fit(formants_arr)
+    mu_w         = pre.transform_formants(formants_arr)
+    sigma_w      = None
+    if ds and "formants_std" in ds[0]:
+        sigma_w = pre.transform_formant_sigma(
+            np.stack([s["formants_std"] for s in ds], axis=0)
+        )
+
+    overall_results     = []
+    per_formant_results = []
+
+    for layer_idx, sequences in layer_iter:
+        X = _pool_if_needed(sequences)
+        del sequences
+
+        # Overall mean R²
+        model, r2_mean = train_formant_mlp(X, mu_w, sigma_w)
+        overall_results.append({"layer": layer_idx, "r2": r2_mean})
+        del model
+
+        # Per-formant R²
+        r2s = []
+        for f_idx in range(mu_w.shape[1]):
+            s_f = sigma_w[:, f_idx:f_idx+1] if sigma_w is not None else None
+            model, r2 = train_formant_mlp(X, mu_w[:, f_idx:f_idx+1], s_f)
+            r2s.append(r2)
+            del model
+        per_formant_results.append({"layer": layer_idx, "r2": r2s})
+        del X
+
+        import gc, torch
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+    return overall_results, per_formant_results
+
+
+def run_formant_probe(
+    model_name: str,
+    hf_dataset,
+    sr: int = 16000,
+    cache_root: str = "cache",
+    use_cache: bool = True,
+    subset: int | None = None,
+    nucleus_ms: int = 100,
+) -> list[dict]:
+    """
+    Run the formant regression probe (MLP + Gaussian NLL) across all layers,
+    streaming one layer at a time.
+
+    Produces:
+      - formant R² plot (mean across F1-F4)
+      - per-formant R² plot
+
+    Returns
+    -------
+    list of {"layer": int, "r2": float} dicts
+    """
+    ds = hf_dataset[:subset] if subset else hf_dataset
+    layer_iter, labels, formants = _get_sequence_embeddings(
+        model_name, ds, sr, cache_root, use_cache, subset=None,
+        nucleus_ms=nucleus_ms,
+    )
+    overall, per_formant = _probe_formant_common(ds, layer_iter, labels, formants)
+    plot_formant_r2(overall)
+    plot_formant_r2_per_formant(per_formant)
+    return overall
+
+
+def run_vowel_probe(
+    model_name: str,
+    hf_dataset,
+    sr: int = 16000,
+    cache_root: str = "cache",
+    use_cache: bool = True,
+    subset: int | None = None,
+    nucleus_ms: int = 100,
+) -> tuple[list[dict], dict]:
+    """
+    Run the frame-level vowel probe (SGDClassifier) across all layers,
+    streaming one layer at a time. PCA/UMAP are generated for the best
+    layer by loading only that layer from disk.
+
+    Produces:
+      - layerwise accuracy plot
+      - PCA plot of the best layer
+      - UMAP plot of the best layer (skipped if umap-learn absent)
+
+    Returns
+    -------
+    (probe_results, label_mapping)
+    """
+    from probing import probe_layer
+    from embedding_cache import load_layer, cache_dir_for
+
+    ds     = hf_dataset[:subset] if subset else hf_dataset
+    groups = _groups_from(ds)
+
+    layer_iter, labels, formants = _get_sequence_embeddings(
+        model_name, ds, sr, cache_root, use_cache, subset=None,
+        nucleus_ms=nucleus_ms,
+    )
+    _, mapping = labels_to_ints(labels)
+
+    results = []
+    for layer_idx, sequences in layer_iter:
+        seqs = [s[None, :] if s.ndim == 1 else s for s in sequences]
+        result = probe_layer(seqs, labels, groups=groups)
+        result["layer"] = layer_idx
+        results.append(result)
+        from viz import _print_layer_result  # local to avoid circular
+        _print_layer_result(layer_idx, result)
+        del sequences, seqs
 
     plot_layerwise_accuracy(results)
 
-    # PCA on best layer
-    best = max(results, key=lambda r: r['accuracy'])
-    best_layer_idx = best['layer']
-
-    X_best = np.stack(all_layers_embeddings[best_layer_idx], axis=0)
-    plot_pca_embeddings(X_best, labels, title=f"PCA Layer {best_layer_idx}")
-
-    try:
-        plot_umap_embeddings(X_best, labels)
-    except Exception:
-        pass
+    # PCA / UMAP: load only the best layer from disk
+    best_layer = max(results, key=lambda r: r["accuracy"])["layer"]
+    from embedding_cache import cache_dir_for as _cdir
+    from embeddings import get_or_compute_embeddings as _gce, pool
+    cache_params = {
+        "model_name":      model_name,
+        "sample_rate":     sr,
+        "nucleus_ms":      nucleus_ms,
+        "dataset_size":    len(ds),
+        "store_sequences": True,
+    }
+    cache_dir  = cache_dir_for("cache", model_name, cache_params)
+    best_seqs  = load_layer(cache_dir, best_layer)
+    if best_seqs is not None:
+        X_best = np.stack([pool(s, "mean") for s in best_seqs], axis=0)
+        plot_pca_embeddings(X_best, labels, title=f"PCA Layer {best_layer}")
+        try:
+            plot_umap_embeddings(X_best, labels)
+        except Exception:
+            pass
+        del best_seqs, X_best
 
     return results, mapping
 
-def run_layerwise_probe_on_hf_dataset(
-    model_name,
+
+def run_probe(
+    model_name: str,
     hf_dataset,
-    sr=16000,
-    pooling="mean",
-    cache_root="cache",
-    use_cache=True,
-    subset=None,
-    nucleus_ms=100
-):
-    all_layers_embeddings, labels, formants = get_or_compute_embeddings(
-        model_name,
-        hf_dataset,
-        sr=16000,
-        pooling=pooling,
-        cache_root=cache_root,
-        use_cache=use_cache,
-        subset=subset,
-        nucleus_ms=nucleus_ms
+    sr: int = 16000,
+    cache_root: str = "cache",
+    use_cache: bool = True,
+    subset: int | None = None,
+    nucleus_ms: int = 100,
+) -> tuple[list[dict], dict]:
+    """
+    Convenience wrapper: run both formant and vowel probes.
+
+    Returns
+    -------
+    (vowel_probe_results, label_mapping)
+    """
+    run_formant_probe(
+        model_name, hf_dataset, sr=sr,
+        cache_root=cache_root, use_cache=use_cache,
+        subset=subset, nucleus_ms=nucleus_ms,
+    )
+    return run_vowel_probe(
+        model_name, hf_dataset, sr=sr,
+        cache_root=cache_root, use_cache=use_cache,
+        subset=subset, nucleus_ms=nucleus_ms,
     )
 
-    # Run formant probes
-    reg_results = run_formant_probe(all_layers_embeddings, formants)
-    plot_formant_r2(reg_results)
 
-    reg_results = run_formant_regression_per_formant(all_layers_embeddings, formants)
-    plot_formant_r2_per_formant(reg_results)
+# ---------------------------------------------------------------------------
+# k-fold trainers
+# ---------------------------------------------------------------------------
 
-    # Run vowel probes
-    return _run_probes(all_layers_embeddings, labels, pooling)
-
-def run_train_multihead(
-    model_name,
+def run_kfold(
+    model_name: str,
     hf_dataset,
-    sr=16000,
-    pooling="mean",
-    cache_root="cache",
-    use_cache=True,
-    subset=None,
-    nucleus_ms=100
-):
-    embeddings, labels, formants = get_or_compute_embeddings(
-        model_name,
-        hf_dataset,
-        sr=sr,
-        pooling=pooling,
-        cache_root=cache_root,
-        use_cache=use_cache,
-        subset=subset,
-        nucleus_ms=nucleus_ms
+    sr: int = 16000,
+    pooling: str = "mean",
+    cache_root: str = "cache",
+    use_cache: bool = True,
+    subset: int | None = None,
+    nucleus_ms: int = 100,
+    trainer_kwargs: dict | None = None,
+) -> list[dict]:
+    """
+    k-fold cross-validation using ThreeHeadPooled (sample-mode VTL pipeline).
+
+    Parameters
+    ----------
+    trainer_kwargs : passed directly to ThreeHeadTrainer (e.g. k, epochs, lr)
+
+    Returns
+    -------
+    list of per-fold result dicts
+    """
+    embeddings, labels, formants = _get_embeddings(
+        model_name, hf_dataset, sr, pooling,
+        cache_root, use_cache, subset, nucleus_ms
     )
+    groups  = _groups_from(hf_dataset[:subset] if subset else hf_dataset)
+    trainer = ThreeHeadTrainer(**(trainer_kwargs or {}))
+    return trainer.fit(embeddings, labels, np.asarray(formants), groups)
 
-    model = train_multihead(
-        embeddings=embeddings,
-        labels=labels,
-        formants=formants,
-        layer_formant=4,
-        layer_vowel=12,
-        epochs=300
+
+def run_kfold_phys(
+    model_name: str,
+    hf_dataset,
+    sr: int = 16000,
+    pooling: str = "mean",
+    cache_root: str = "cache",
+    use_cache: bool = True,
+    subset: int | None = None,
+    nucleus_ms: int = 100,
+    trainer_kwargs: dict | None = None,
+) -> list[dict]:
+    """
+    k-fold cross-validation using TwoHeadPooledPhys (blended-mode VTL pipeline).
+
+    Parameters
+    ----------
+    trainer_kwargs : passed directly to PhysHeadTrainer (e.g. k, epochs, alpha)
+
+    Returns
+    -------
+    list of per-fold result dicts
+    """
+    embeddings, labels, formants = _get_embeddings(
+        model_name, hf_dataset, sr, pooling,
+        cache_root, use_cache, subset, nucleus_ms
     )
+    groups  = _groups_from(hf_dataset[:subset] if subset else hf_dataset)
+    trainer = PhysHeadTrainer(**(trainer_kwargs or {}))
+    return trainer.fit(embeddings, labels, np.asarray(formants), groups)
 
-    torch.save(model.state_dict(), "twohead_pooled.pt")
-    print("Saved trained pooled‑embedding heads to twohead_pooled.pt")
 
+# ---------------------------------------------------------------------------
+# Averaged production model
+# ---------------------------------------------------------------------------
+
+def run_averaged_model(
+    model_name: str,
+    hf_dataset,
+    sr: int = 16000,
+    pooling: str = "mean",
+    cache_root: str = "cache",
+    use_cache: bool = True,
+    subset: int | None = None,
+    nucleus_ms: int = 100,
+    save_path: str = "model.pt",
+    trainer_kwargs: dict | None = None,
+    use_phys_pipeline: bool = False,
+) -> torch.nn.Module:
+    """
+    Run k-fold, average fold weights, fine-tune on the full dataset, and save.
+
+    Parameters
+    ----------
+    save_path          : path to write the final state_dict (.pt)
+    trainer_kwargs     : passed to the trainer constructor
+    use_phys_pipeline  : if True, use PhysHeadTrainer; otherwise ThreeHeadTrainer
+
+    Returns
+    -------
+    Fine-tuned nn.Module
+    """
+    embeddings, labels, formants = _get_embeddings(
+        model_name, hf_dataset, sr, pooling,
+        cache_root, use_cache, subset, nucleus_ms
+    )
+    groups = _groups_from(hf_dataset[:subset] if subset else hf_dataset)
+
+    TrainerClass = PhysHeadTrainer if use_phys_pipeline else ThreeHeadTrainer
+    trainer = TrainerClass(**(trainer_kwargs or {}))
+    model   = trainer.fit_averaged(embeddings, labels, np.asarray(formants), groups)
+
+    torch.save(model.state_dict(), save_path)
+    print(f"Saved averaged + fine-tuned model to {save_path}")
     return model
-
-def run_eval_multihead(
-    model,
-    model_name,
-    hf_dataset,
-    sr=16000,
-    pooling="mean",
-    cache_root="cache",
-    use_cache=True,
-    subset=None,
-    nucleus_ms=100
-):
-    embeddings, labels, formants = get_or_compute_embeddings(
-        model_name,
-        hf_dataset,
-        sr=sr,
-        pooling=pooling,
-        cache_root=cache_root,
-        use_cache=use_cache,
-        subset=subset,
-        nucleus_ms=nucleus_ms
-    )
-
-    results = evaluate_multihead(
-        model,
-        embeddings,
-        labels,
-        formants,
-        layer_formant=4,
-        layer_vowel=12
-    )
-
-    print_eval_report(results)
-    return results
-
-def run_train_eval_multihead_kfold(
-    model_name,
-    hf_dataset,
-    sr=16000,
-    pooling="mean",
-    cache_root="cache",
-    use_cache=True,
-    subset=None,
-    nucleus_ms=100
-):
-    embeddings, labels, formants = get_or_compute_embeddings(
-        model_name,
-        hf_dataset,
-        sr=sr,
-        pooling=pooling,
-        cache_root=cache_root,
-        use_cache=use_cache,
-        subset=subset,
-        nucleus_ms=nucleus_ms
-    )
-    
-    groups = [item["group"] for item in hf_dataset]
-
-    results = train_multihead_kfold(
-        embeddings,
-        labels,
-        formants,
-        groups=groups,
-        k=5,
-        epochs=300,
-        lr=1e-3,
-        batch_size=64
-    )
-    return results
-
-def run_train_eval_multihead_phys_kfold(
-    model_name,
-    hf_dataset,
-    sr=16000,
-    pooling="mean",
-    cache_root="cache",
-    use_cache=True,
-    subset=None,
-    nucleus_ms=100
-):
-    embeddings, labels, formants = get_or_compute_embeddings(
-        model_name,
-        hf_dataset,
-        sr=sr,
-        pooling=pooling,
-        cache_root=cache_root,
-        use_cache=use_cache,
-        subset=subset,
-        nucleus_ms=nucleus_ms
-    )
-    
-    groups = [item["group"] for item in hf_dataset]
-
-    results = train_multihead_kfold_phys(
-        embeddings,
-        labels,
-        formants,
-        groups=groups,
-        layer_formant=4,
-        layer_vowel=12,
-        k=5,
-        epochs=300,
-        lr=1e-3,
-        batch_size=64
-    )
-    return results
-
-# def run_layerwise_probe_on_hf_dataset(
-#     model_name,
-#     hf_dataset,
-#     sr=16000,
-#     pooling="mean",
-#     cache_root="cache",
-#     use_cache=True,
-#     subset=None,
-#     nucleus_ms=100
-# ):
-#     """
-#     Main entry point for probing HF datasets with caching + pooling.
-#     """
-
-#     # Build cache parameters
-#     cache_params = {
-#         "model_name": model_name,
-#         "pooling": pooling,
-#         "sample_rate": sr,
-#         "subset": subset,
-#         "nucleus_ms": nucleus_ms,
-#         "dataset_size": len(hf_dataset),
-#     }
-
-#     cache_dir = get_cache_dir(cache_root, model_name, cache_params)
-
-#     # Try loading cache
-#     if use_cache:
-#         cached = load_cached_embeddings(cache_dir)
-#         if cached is not None:
-#             labels = [item["label"] for item in hf_dataset]
-#             # After loading cached embeddings
-#             for layer_idx, layer in enumerate(cached):
-#                 if len(layer) != len(labels):
-#                     print(f"Cache incomplete for layer {layer_idx}: "
-#                         f"{len(layer)} vs {len(labels)} samples. Ignoring cache.")
-#                     cached = None
-#                     break
-#             print(f"Loaded cached embeddings from {cache_dir}")
-#             if subset:
-#                 labels = labels[:subset]
-#                 cached = [layer[:subset] for layer in cached]
-#             formants = np.stack([s["formants"] for s in hf_dataset], axis=0)
-
-#             reg_results = run_formant_probe(cached, formants)
-#             plot_formant_r2(reg_results)
-#             reg_results = run_formant_regression_per_formant(cached, formants)
-#             plot_formant_r2_per_formant(reg_results)
-#             return _run_probes(cached, labels, pooling)
-
-#     # Otherwise extract fresh embeddings
-#     print("No cache found — extracting embeddings...")
-#     model, processor, device = load_model(model_name)
-
-#     if subset:
-#         hf_dataset = hf_dataset[:subset]
-
-#     all_layers_embeddings = None
-#     labels = []
-
-#     for idx, sample in tqdm(enumerate(hf_dataset)):
-#         audio = sample["audio"]
-#         label = sample["label"]
-
-#         nucleus = extract_vowel_nucleus(audio, sr=sr, center_ms=nucleus_ms)
-#         layer_embs = extract_all_layers(model, processor, nucleus, sample_rate=sr, device=device)
-
-#         # Pool immediately to save RAM
-#         pooled = [emb.mean(dim=0).cpu().numpy() for emb in layer_embs]
-
-#         # Save to cache
-#         for layer_idx, vec in tqdm(enumerate(pooled)):
-#             save_pooled_embedding(cache_dir, layer_idx, idx, vec)
-
-#         # Accumulate for this run
-#         if all_layers_embeddings is None:
-#             all_layers_embeddings = [[] for _ in pooled]
-#         for i, vec in tqdm(enumerate(pooled)):
-#             all_layers_embeddings[i].append(vec)
-
-#         labels.append(label)
-
-#     print(f"Saved embeddings to cache: {cache_dir}")
-#     formants = np.stack([s["formants"] for s in hf_dataset], axis=0)
-
-#     reg_results = run_formant_probe(all_layers_embeddings, formants)
-#     plot_formant_r2(reg_results)
-
-#     return _run_probes(all_layers_embeddings, labels, pooling)
-
-
