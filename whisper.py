@@ -1,40 +1,67 @@
-# embedding_extraction.py
+# whisper.py
+"""
+Whisper encoder loading and hidden-state extraction.
+
+Keeps all HuggingFace / PyTorch concerns isolated from caching and
+dataset logic.
+"""
+
+from __future__ import annotations
+
 import torch
+import numpy as np
 from transformers import WhisperProcessor, WhisperModel
 
-def load_model(model_name="openai/whisper-small", device=None):
-    device = device or ("cuda" if torch.cuda.is_available() else "cpu")
-    processor = WhisperProcessor.from_pretrained(model_name)
-    model = WhisperModel.from_pretrained(model_name).to(device)
-    model.eval()
-    for p in model.parameters():
-        p.requires_grad = False
-    return model, processor, device
 
-def extract_layer_embeddings(model, processor, audio_array, sample_rate, layer_index=None, device=None):
+class WhisperEncoder:
     """
-    audio_array: 1D numpy or torch array
-    layer_index: None -> return last_hidden_state; int -> return that layer
-    returns: tensor shape (time_steps, hidden_dim)
-    """
-    device = device or next(model.parameters()).device
-    # preprocess audio to model input features
-    inputs = processor(audio_array, sampling_rate=sample_rate, return_tensors="pt")
-    input_features = inputs.input_features.to(device)
-    # run encoder and collect hidden states
-    with torch.no_grad():
-        encoder_outputs = model.encoder(input_features, output_hidden_states=True)
-    hidden_states = encoder_outputs.hidden_states  # tuple: (layer0, layer1, ..., last)
-    if layer_index is None:
-        return hidden_states[-1].squeeze(0).cpu()
-    else:
-        return hidden_states[layer_index].squeeze(0).cpu()
+    Thin wrapper around a frozen Whisper encoder.
 
-def extract_all_layers(model, processor, audio_array, sample_rate, device=None):
-    device = device or next(model.parameters()).device
-    inputs = processor(audio_array, sampling_rate=sample_rate, return_tensors="pt")
-    input_features = inputs.input_features.to(device)
-    with torch.no_grad():
-        encoder_outputs = model.encoder(input_features, output_hidden_states=True)
-    hidden_states = [h.squeeze(0).cpu() for h in encoder_outputs.hidden_states]
-    return hidden_states  # list of tensors per layer
+    Parameters
+    ----------
+    model_name : HuggingFace model identifier, e.g. "openai/whisper-small"
+    device     : "cuda", "cpu", or None (auto-detected)
+    """
+
+    def __init__(self, model_name: str = "openai/whisper-small", device: str | None = None):
+        self.model_name = model_name
+        self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
+
+        print(f"Loading {model_name} on {self.device}...")
+        self.processor = WhisperProcessor.from_pretrained(model_name)
+        self.model = WhisperModel.from_pretrained(model_name).to(self.device)
+        self.model.eval()
+        for p in self.model.parameters():
+            p.requires_grad = False
+
+    @property
+    def num_layers(self) -> int:
+        """Total number of hidden states (including embedding layer 0)."""
+        return self.model.config.encoder_layers + 1
+
+    def extract_all_layers(self, audio: np.ndarray, sample_rate: int = 16000) -> list[np.ndarray]:
+        """
+        Run the encoder and return mean-pooled embeddings for every layer.
+
+        Parameters
+        ----------
+        audio       : 1-D float32 array
+        sample_rate : audio sample rate in Hz
+
+        Returns
+        -------
+        list of (hidden_dim,) arrays, one per encoder layer (including layer 0)
+        """
+        inputs = self.processor(audio, sampling_rate=sample_rate, return_tensors="pt")
+        input_features = inputs.input_features.to(self.device)
+
+        with torch.no_grad():
+            encoder_outputs = self.model.encoder(
+                input_features, output_hidden_states=True
+            )
+
+        # hidden_states is a tuple of (batch=1, time, dim) tensors
+        return [
+            h.squeeze(0).cpu().numpy()  # (time, dim) — pooling done by caller
+            for h in encoder_outputs.hidden_states
+        ]
